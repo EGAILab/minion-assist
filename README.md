@@ -765,6 +765,14 @@ You: ...
 
 If the Matrix dependencies are missing, a clear `RuntimeError` is printed and the REPL starts without Matrix support.
 
+**The homeserver is optional at runtime.** If it's unreachable (down, DNS failure, a reverse proxy returning an error page, etc.) either at startup or mid-session, the bot keeps running — the sync loop retries in the background instead of crashing the listener thread. You'll see exactly one line when it goes down and one when it comes back, not a repeated stream of errors:
+
+```
+[matrix] Warning: homeserver unreachable (...); will keep retrying in the background.
+...
+[matrix] Homeserver connection restored.
+```
+
 ---
 
 ## Multi-Agent Workspace
@@ -2378,9 +2386,9 @@ error = policy.check_command("curl 169.254.169.254")        # command / SSRF + r
 
 ---
 
-### Plugin System (`plugins.py`)
+### Startup Extension Loader (`plugins.py`)
 
-The plugin system lets you extend minion-assist with custom tools, registry hooks, and skills — no source edits required.
+The startup extension loader lets you add custom tools, tool-observer hooks, skills, and slash commands without editing core source. It is not a general application plugin framework: manifests are imported during startup, registrations have no owning lifecycle or unload operation, dependencies do not control activation, and providers, prompt assembly, memory, persistence, channels, schedulers, and the agent loop are not replaceable through this mechanism.
 
 **Manifest format** (`~/.minion-assist/plugins.json` or `.minion-assist/plugins.json`):
 
@@ -2460,6 +2468,8 @@ Plugin commands appear in `/help` output under "Plugin commands:" and are dispat
 
 **`"trust"` field** — `"trusted"` (default, your own code) or `"external"` (third-party code). External plugins print a warning at load time; no other runtime effect.
 
+**Advisory metadata:** `permissions`, `dependencies`, `min_minion_assist_version`, and `mcp_servers` currently produce informational messages only. They are not permission checks, dependency resolution, compatibility enforcement, or automatic MCP activation.
+
 **`extra_plugin_manifests` config key** — register additional manifest files beyond the two fixed locations. Set in `config.json`:
 
 ```json
@@ -2472,6 +2482,8 @@ Plugin commands appear in `/help` output under "Plugin commands:" and are dispat
 **Priority:** project-local manifest (`.minion-assist/plugins.json`) loads after global (`~/.minion-assist/plugins.json`), so local tools override global ones with the same name.
 
 **Security note:** plugin files are executed with `importlib`. Only add paths to files you trust.
+
+**Lifecycle limitations:** loading is not transactional. If a later contribution fails, contributions already registered from that manifest remain active. Tool observers and plugin commands have no public owner-bound removal operation, and plugin resources are not automatically closed during shutdown.
 
 ---
 
@@ -2855,7 +2867,7 @@ This opens `https://auth.openai.com/codex/device` in your browser, prompts you t
 
 All tools from the agent's `ToolRegistry` (web search, Playwright, memory, file tools, etc.) are registered with Codex as **dynamic tools** at session start.  Codex can then call them during inference exactly as it uses its own built-in tools.  When Codex invokes one, minion-assist executes it via `registry.execute()` and replies with the result — the same execution path used by all other LLM backends.
 
-This mirrors [openclaw's dynamic tool bridge](../minion-assist-docs/22-codex-provider-setup.md) and means there is no Codex-specific subset of tools — the same full tool set is available regardless of backend.
+This mirrors [OpenClaw's dynamic tool bridge](../minion-assist-docs/old-docs/22-codex-provider-setup.md) and means there is no Codex-specific subset of tools — the same full tool set is available regardless of backend.
 
 ### Built-in tool approval
 

@@ -21,6 +21,7 @@ loop.  The main thread's REPL continues unaffected.
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 from pathlib import Path
 
@@ -33,6 +34,56 @@ from .handler import MatrixMessageHandler
 from .inbound_dedupe import MatrixInboundDeduper
 from .outbound import MatrixOutbound
 from .room_sessions import MatrixRoomSessionManager
+
+# How long to wait before letting matrix-nio's sync_forever() retry again after
+# a failed sync.  Without this, a homeserver that responds with something
+# that isn't valid Matrix JSON (e.g. a reverse proxy's error page when the
+# real homeserver is down) makes nio's own sync loop retry *instantly* in a
+# tight loop forever -- nio only backs off on its own for raised connection
+# exceptions (timeouts/refused connections), not on a "successful" HTTP
+# response that merely fails schema validation.
+_SYNC_ERROR_BACKOFF_SECONDS = 10.0
+
+
+class _SyncHealthTracker:
+    """Turns matrix-nio's per-attempt sync errors into one-line transitions.
+
+    Without this, every single failed sync poll logs matrix-nio's own
+    "Error validating response: ..." warning -- e.g. once every
+    ``_SYNC_ERROR_BACKOFF_SECONDS`` while a homeserver is down, forever.
+    Instead, this prints exactly one warning when the homeserver first
+    becomes unreachable, stays quiet while it keeps failing, and prints
+    exactly one "restored" message the moment it next succeeds.  Register
+    :meth:`on_sync_error` and :meth:`on_sync_success` via matrix-nio's
+    ``client.add_response_callback()`` for ``SyncError``/``SyncResponse``.
+    """
+
+    def __init__(self, backoff_seconds: float = _SYNC_ERROR_BACKOFF_SECONDS) -> None:
+        self.down = False
+        self.backoff_seconds = backoff_seconds
+
+    async def on_sync_error(self, response) -> None:
+        """Called by matrix-nio with the ``SyncError`` from a failed sync."""
+        if not self.down:
+            self.down = True
+            reason = getattr(response, "message", None) or getattr(
+                response, "status_code", None
+            ) or response
+            print(
+                f"[matrix] Warning: homeserver unreachable ({reason}); "
+                "will keep retrying in the background.",
+                file=sys.stderr,
+            )
+        # Back off before nio's sync_forever() loops around to retry --
+        # otherwise a dead homeserver gets hammered with requests as fast as
+        # the event loop can send them.
+        await asyncio.sleep(self.backoff_seconds)
+
+    async def on_sync_success(self, response) -> None:
+        """Called by matrix-nio with the ``SyncResponse`` from a successful sync."""
+        if self.down:
+            self.down = False
+            print("[matrix] Homeserver connection restored.")
 
 
 async def monitor_matrix(
@@ -130,12 +181,24 @@ async def monitor_matrix(
             ReactionEvent,
             RoomMessageImage,
             RoomMessageText,
+            SyncError,
+            SyncResponse,
         )
     except ImportError as exc:
         raise RuntimeError(
             "matrix-nio is not installed. "
             "Run: uv add --optional matrix matrix-nio aiosqlite"
         ) from exc
+
+    # Silence matrix-nio's own "Error validating response: ..." warning --
+    # it's the only warning nio/responses.py ever logs, and _SyncHealthTracker
+    # (registered below) replaces it with a single clean down/restored
+    # message instead of one log line per failed sync poll.
+    logging.getLogger("nio.responses").setLevel(logging.ERROR)
+
+    sync_health = _SyncHealthTracker()
+    client.add_response_callback(sync_health.on_sync_error, SyncError)
+    client.add_response_callback(sync_health.on_sync_success, SyncResponse)
 
     # Step 5: register callbacks.  matrix-nio calls these for each matching event
     # during the sync loop.
